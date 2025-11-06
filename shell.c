@@ -6,6 +6,7 @@
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "parser/ast.h"
 #include "shell.h"
 
@@ -24,12 +25,6 @@ void initialize(void)
 }
 
 void execute_command(node_t *node) {
-    if (node->type != NODE_COMMAND) {
-        fprintf(stderr, "Error: expected NODE_COMMAND\n");
-        return;
-    }
-    
-    // Extract command details
     char *program = node->command.program;
     char **argv = node->command.argv;
     int argc = node->command.argc;
@@ -76,7 +71,7 @@ void execute_command(node_t *node) {
         return;
     }
     else if (pid == 0) {
-        // Child process: restore default signal handlers
+        // restore default signal handlers
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
@@ -96,21 +91,11 @@ void execute_command(node_t *node) {
 }
 
 void execute_sequence(node_t *node) {
-    if (node->type != NODE_SEQUENCE) {
-        fprintf(stderr, "Error: expected NODE_SEQUENCE\n");
-        return;
-    }
-    
     run_command(node->sequence.first);
     run_command(node->sequence.second);
 }
 
 void execute_pipe(node_t *node) {
-    if (node->type != NODE_PIPE) {
-        fprintf(stderr, "Error: expected NODE_PIPE\n");
-        return;
-    }
-    
     int n = node->pipe.n_parts;
     
     // Array of PIDs of child processes
@@ -178,20 +163,126 @@ void execute_pipe(node_t *node) {
             }
         }
     }
-    
-    // PADRE: chiudi tutte le pipe
+
     for (int i = 0; i < n - 1; i++) {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
     
-    // Aspetta tutti i figli
     for (int i = 0; i < n; i++) {
         waitpid(pids[i], NULL, 0);
     }
     
     free(pids);
     free(pipes);
+}
+
+void execute_redirect(node_t *node) {    
+    node_t *child = node->redirect.child;
+    int fd = node->redirect.fd;
+    int mode = node->redirect.mode;
+    char *target = node->redirect.target;
+    
+    pid_t pid = fork();
+    
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
+    
+    if (pid == 0) { 
+        // child process, restores default signal handlers       
+        int file_fd;
+        
+        switch (mode) {
+            case REDIRECT_INPUT:
+                file_fd = open(target, O_RDONLY);
+                if (file_fd < 0) {
+                    perror(target);
+                    exit(1);
+                }
+                
+                if (dup2(file_fd, STDIN_FILENO) < 0) {
+                    perror("dup2");
+                    exit(1);
+                }
+                
+                close(file_fd);
+                break;
+                
+            case REDIRECT_OUTPUT:
+                // case >
+                file_fd = open(target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (file_fd < 0) {
+                    perror(target);
+                    exit(1);
+                }
+                
+                int target_fd = (fd < 0) ? STDOUT_FILENO : fd;
+                
+                if (dup2(file_fd, target_fd) < 0) {
+                    perror("dup2");
+                    exit(1);
+                }
+                
+                if (fd < 0) {
+                    if (dup2(file_fd, STDERR_FILENO) < 0) {
+                        perror("dup2");
+                        exit(1);
+                    }
+                }
+                
+                close(file_fd);
+                break;
+                
+            case REDIRECT_APPEND:
+                // case >>
+                file_fd = open(target, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (file_fd < 0) {
+                    perror(target);
+                    exit(1);
+                }
+                
+                target_fd = (fd < 0) ? STDOUT_FILENO : fd;
+                
+                if (dup2(file_fd, target_fd) < 0) {
+                    perror("dup2");
+                    exit(1);
+                }
+                
+                if (fd < 0) {
+                    if (dup2(file_fd, STDERR_FILENO) < 0) {
+                        perror("dup2");
+                        exit(1);
+                    }
+                }
+                
+                close(file_fd);
+                break;
+                
+            case REDIRECT_DUP:
+                // case >& o <&
+                if (dup2(node->redirect.fd2, fd) < 0) {
+                    perror("dup2");
+                    exit(1);
+                }
+                break;
+                
+            default:
+                fprintf(stderr, "Unknown redirect type: %d\n", mode);
+                exit(1);
+        }
+
+        // Execute the command with the active redirection
+        run_command(child);
+        exit(0);
+    }
+    else {
+        int status;
+        if (waitpid(pid, &status, 0) < 0) {
+            perror("waitpid");
+        }
+    }
 }
 
 void run_command(node_t *node)
@@ -215,7 +306,7 @@ void run_command(node_t *node)
         break;
         
     case NODE_REDIRECT:
-        fprintf(stderr, "not yet implemented\n");
+        execute_redirect(node);
         break;
         
     case NODE_SUBSHELL:
